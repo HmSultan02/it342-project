@@ -4,25 +4,28 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import * as dotenv from "dotenv";
 
-if (!process.env.PG_HOST) {
-  dotenv.config({ path: ".env.local" });
-}
+dotenv.config({ path: ".env.local" });
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+/* ============================
+   DATABASE CONNECTION
+============================ */
 const pool = new Pool({
   host: process.env.PG_HOST,
   user: process.env.PG_USER,
   password: process.env.PG_PASSWORD,
   database: process.env.PG_DATABASE,
-  port: parseInt(process.env.PG_PORT || "5432", 10),
-  ssl: { rejectUnauthorized: false },
+  port: Number(process.env.PG_PORT || 5432),
+  ssl: { rejectUnauthorized: false }
 });
 
-const JWT_SECRET =
-  process.env.NEXTAUTH_SECRET || "fallback-secret-for-development";
+const JWT_SECRET = process.env.NEXTAUTH_SECRET || "dev-secret";
 
+/* ============================
+   MIDDLEWARE
+============================ */
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -33,102 +36,108 @@ app.use((req, res, next) => {
   next();
 });
 
+/* ============================
+   SIGN UP
+============================ */
 app.post("/api/signup", async (req, res) => {
   const { userid, password } = req.body;
 
   if (!userid || !password) {
-    return res
-      .status(400)
-      .json({ message: "Missing required fields (userid and password)." });
+    return res.status(400).json({ message: "Missing fields" });
   }
 
   try {
-    const hashedPassword = await bcrypt.hash(password, 10);
-    const queryText = `
-            INSERT INTO users (userID, password)
-            VALUES ($1, $2)
-            RETURNING "userid";
-        `;
-    const result = await pool.query(queryText, [userid, hashedPassword]);
+    const hashed = await bcrypt.hash(password, 10);
 
-    const newUser = result.rows[0];
-    console.log(`New user created: ${newUser.userid}`);
-    return res.status(201).json({
-      message: "Account created successfully.",
-      user: { userid: newUser.userid },
+    const result = await pool.query(
+      `INSERT INTO users (userid, password)
+       VALUES ($1, $2)
+       RETURNING userid`,
+      [userid, hashed]
+    );
+
+    res.status(201).json({
+      message: "Account created",
+      user: result.rows[0]
     });
-  } catch (error) {
-    console.error("Account creation error:", error);
-    // PostgreSQL duplicate key error code
-    if (error.code === "23505") {
-      return res.status(409).json({ message: "Username already exists." });
+  } catch (err) {
+    if (err.code === "23505") {
+      return res.status(409).json({ message: "User already exists" });
     }
-    return res.status(500).json({
-      message: "An internal server error occurred during account creation.",
-    });
+    res.status(500).json({ message: "Server error" });
   }
 });
 
+/* ============================
+   SIGN IN
+============================ */
 app.post("/api/auth/signin", async (req, res) => {
   const { userid, password } = req.body;
 
   if (!userid || !password) {
-    return res
-      .status(401)
-      .json({ message: "Authentication failed. Missing credentials." });
+    return res.status(401).json({ message: "Missing credentials" });
   }
 
-  let client;
   try {
-    client = await pool.connect();
-    const queryText = `
-            SELECT "userid", password
-            FROM users 
-            WHERE LOWER(userid) = LOWER($1)
-        `;
-    const result = await client.query(queryText, [userid]);
+    const result = await pool.query(
+      `SELECT userid, password FROM users WHERE LOWER(userid) = LOWER($1)`,
+      [userid]
+    );
+
     const user = result.rows[0];
-
     if (!user) {
-      console.log(`Login attempt for non-existent user: ${userid}`);
-      return res.status(401).json({
-        message: "Authentication failed. Invalid username or password.",
-      });
+      return res.status(401).json({ message: "Invalid login" });
     }
 
-    const isValid = await bcrypt.compare(password, user.password);
-
-    if (!isValid) {
-      console.log(`Wrong password for user: ${user.userid}`);
-      return res.status(401).json({
-        message: "Authentication failed. Invalid username or password.",
-      });
+    const valid = await bcrypt.compare(password, user.password);
+    if (!valid) {
+      return res.status(401).json({ message: "Invalid login" });
     }
 
-    const token = jwt.sign({ id: user.userid, iat: Date.now() }, JWT_SECRET, {
-      expiresIn: "7d",
+    const token = jwt.sign({ userid }, JWT_SECRET, { expiresIn: "7d" });
+
+    res.json({
+      message: "Login successful",
+      token,
+      user: { userid }
     });
-
-    console.log("Successful login and token generated.");
-
-    return res.status(200).json({
-      message: "Authentication successful.",
-      token: token,
-      user: { id: user.userid },
-    });
-  } catch (error) {
-    console.error("Internal sign-in error:", error);
-    return res
-      .status(500)
-      .json({ message: "An internal server error occurred." });
-  } finally {
-    if (client) {
-      client.release();
-    }
+  } catch (err) {
+    res.status(500).json({ message: "Server error" });
   }
 });
 
+/* ============================
+   USER SEARCH (BACKEND SEARCH)
+============================ */
+app.get("/api/search/users", async (req, res) => {
+  const q = String(req.query.q || "").trim();
+
+  if (!q) {
+    return res.json({ results: [] });
+  }
+
+  try {
+    const result = await pool.query(
+      `
+      SELECT userid
+      FROM users
+      WHERE userid ILIKE $1
+      ORDER BY userid
+      LIMIT 20
+      `,
+      [`%${q}%`]
+    );
+
+    res.json({ results: result.rows });
+  } catch (err) {
+    console.error("User search error:", err);
+    res.status(500).json({ message: "Search failed" });
+  }
+});
+
+/* ============================
+   START SERVER
+============================ */
 app.listen(PORT, () => {
-  console.log(`Express API Service listening on port ${PORT}`);
-  console.log(`DB Host: ${process.env.PG_HOST}`);
+  console.log(`API running on port ${PORT}`);
 });
